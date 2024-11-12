@@ -1,6 +1,6 @@
 # Gaussian Splatting for Object Reconstruction
 
-Output: 
+## Output: 
 
 Truck
 
