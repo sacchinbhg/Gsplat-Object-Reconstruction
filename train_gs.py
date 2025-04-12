@@ -34,7 +34,7 @@ TENSORBOARD_FOUND = True
 
 def training(args, dataset, opt, pipe, testing_iterations, saving_iterations, checkpoint_iterations, checkpoint, debug_from):
     if args.use_dust3r:
-        print('Use pose refinement from dust3r')
+        print('Using pose refinement from dust3r')
         from gaussian_renderer import render_w_pose as render
     else:
         from gaussian_renderer import render
@@ -44,6 +44,7 @@ def training(args, dataset, opt, pipe, testing_iterations, saving_iterations, ch
     gaussians = GaussianModel(dataset.sh_degree)
     scene = Scene(dataset, gaussians, extra_opts=args)
     gaussians.training_setup(opt)
+
     if checkpoint:
         (model_params, first_iter) = torch.load(checkpoint)
         gaussians.restore(model_params, opt)
@@ -53,19 +54,21 @@ def training(args, dataset, opt, pipe, testing_iterations, saving_iterations, ch
 
     iter_start = torch.cuda.Event(enable_timing = True)
     iter_end = torch.cuda.Event(enable_timing = True)
-
-    viewpoint_stack, augview_stack = None, None
+    viewpoint_stack = None
     ema_loss_for_log = 0.0
+
     progress_bar = tqdm(range(first_iter, opt.iterations), desc="Training progress")
     first_iter += 1
-    for iteration in range(first_iter, opt.iterations + 1):        
-        if network_gui.conn == None:
+
+    for iteration in range(first_iter, opt.iterations + 1):
+        if network_gui.conn is None:
             network_gui.try_connect()
-        while network_gui.conn != None:
+
+        while network_gui.conn is not None:
             try:
                 net_image_bytes = None
                 custom_cam, do_training, pipe.convert_SHs_python, pipe.compute_cov3D_python, keep_alive, scaling_modifer = network_gui.receive()
-                if custom_cam != None:
+                if custom_cam is not None:
                     net_image = render(custom_cam, gaussians, pipe, background, scaling_modifer)["render"]
                     net_image_bytes = memoryview((torch.clamp(net_image, min=0, max=1.0) * 255).byte().permute(1, 2, 0).contiguous().cpu().numpy())
                 network_gui.send(net_image_bytes, dataset.source_path)
@@ -74,109 +77,107 @@ def training(args, dataset, opt, pipe, testing_iterations, saving_iterations, ch
             except Exception as e:
                 network_gui.conn = None
 
-        iter_start.record() # type: ignore
+        iter_start.record()
         gaussians.update_learning_rate(iteration)
 
-        # Every 1000 its we increase the levels of SH up to a maximum degree
         if iteration % 1000 == 0:
             gaussians.oneupSHdegree()
 
-        # Pick a random Camera
         if not viewpoint_stack:
             viewpoint_stack = scene.getTrainCameras().copy()
         viewpoint_cam = viewpoint_stack.pop(randint(0, len(viewpoint_stack)-1))
 
-        if args.use_dust3r:
+        # Setup pose optimizer (for dust3r or bundle_adjust)
+        pose_optimizer = None
+        if (args.use_dust3r or args.bundle_adjust) and hasattr(viewpoint_cam, "cam_rot_delta"):
             pose_opt_params = [
-                {
-                    "params": [viewpoint_cam.cam_rot_delta],
-                    "lr": 0.003,
-                    "name": "rot_{}".format(viewpoint_cam.uid),
-                },
-                {
-                    "params": [viewpoint_cam.cam_trans_delta],
-                    "lr": 0.001,
-                    "name": "trans_{}".format(viewpoint_cam.uid),
-                }
+                {"params": [viewpoint_cam.cam_rot_delta], "lr": opt.pose_lr_rot},
+                {"params": [viewpoint_cam.cam_trans_delta], "lr": opt.pose_lr_trans}
             ]
             pose_optimizer = torch.optim.Adam(pose_opt_params)
 
-        # Render
         if (iteration - 1) == debug_from:
             pipe.debug = True
 
         bg = torch.rand((3), device="cuda") if opt.random_background else background
 
         render_pkg = render(viewpoint_cam, gaussians, pipe, bg)
-        image, viewspace_point_tensor, visibility_filter, radii = render_pkg["render"], \
-            render_pkg["viewspace_points"], render_pkg["visibility_filter"], render_pkg["radii"]
+        image = render_pkg["render"]
+        viewspace_point_tensor = render_pkg["viewspace_points"]
+        visibility_filter = render_pkg["visibility_filter"]
+        radii = render_pkg["radii"]
 
-        # Loss
+        # Loss and backprop
         loss, Ll1 = cal_loss(opt, args, image, render_pkg, viewpoint_cam, bg, tb_writer=tb_writer, iteration=iteration, mono_loss_type=args.mono_loss_type)
-
         loss.backward()
-        iter_end.record()  # type: ignore
 
+        iter_end.record()
+
+        # Optimizer step
         with torch.no_grad():
-            # Progress bar
+            if iteration < opt.iterations:
+                gaussians.optimizer.step()
+                gaussians.optimizer.zero_grad(set_to_none=True)
+
+                if pose_optimizer is not None and iteration < opt.pose_iterations:
+                    pose_optimizer.step()
+                    pose_optimizer.zero_grad(set_to_none=True)
+                    _ = update_pose(viewpoint_cam)
+
+            # Logging and diagnostics
             ema_loss_for_log = 0.4 * loss.item() + 0.6 * ema_loss_for_log
             num_gauss = len(gaussians._xyz)
             if iteration % 10 == 0:
-                progress_bar.set_postfix({'Loss': f"{ema_loss_for_log:.{7}f}",  'n': f"{num_gauss}"})
+                progress_bar.set_postfix({'Loss': f"{ema_loss_for_log:.7f}", 'n': f"{num_gauss}"})
                 progress_bar.update(10)
             if iteration == opt.iterations:
                 progress_bar.close()
 
-            # Log and save
             training_report(tb_writer, iteration, Ll1, loss, l1_loss, iter_start.elapsed_time(iter_end), testing_iterations, scene, render, (pipe, background))
-            if (iteration in saving_iterations):
-                print("\n[ITER {}] Saving Gaussians".format(iteration))
+
+            if iteration in saving_iterations:
+                print(f"\n[ITER {iteration}] Saving Gaussians")
                 scene.save(iteration)
 
             # Densification
             if iteration < opt.densify_until_iter and num_gauss < opt.max_num_splats:
-                # Keep track of max radii in image-space for pruning
                 gaussians.max_radii2D[visibility_filter] = torch.max(gaussians.max_radii2D[visibility_filter], radii[visibility_filter])
                 gaussians.add_densification_stats(viewspace_point_tensor, visibility_filter)
 
                 if iteration > opt.densify_from_iter and iteration % opt.densification_interval == 0:
                     size_threshold = 20 if iteration > opt.opacity_reset_interval else None
                     gaussians.densify_and_prune(opt.densify_grad_threshold, 0.005, scene.cameras_extent, size_threshold)
-                
+
                 if iteration % opt.opacity_reset_interval == 0 or (dataset.white_background and iteration == opt.densify_from_iter):
                     gaussians.reset_opacity()
 
                 if iteration % opt.remove_outliers_interval == 0 or (dataset.white_background and iteration == opt.densify_from_iter):
                     gaussians.remove_outliers(opt, iteration, linear=True)
 
-            # Optimizer step
-            if iteration < opt.iterations:
-                gaussians.optimizer.step()
-                gaussians.optimizer.zero_grad(set_to_none = True)
-                if args.use_dust3r and iteration < opt.pose_iterations:
-                    pose_optimizer.step()
-                    pose_optimizer.zero_grad(set_to_none = True)
-                    _ = update_pose(viewpoint_cam)
+            if iteration in checkpoint_iterations:
+                print(f"\n[ITER {iteration}] Saving Checkpoint")
+                torch.save((gaussians.capture(), iteration), scene.model_path + f"/ckpt{iteration}.pth")
 
-            if (iteration in checkpoint_iterations):
-                print("\n[ITER {}] Saving Checkpoint".format(iteration))
-                torch.save((gaussians.capture(), iteration), scene.model_path + "/ckpt" + str(iteration) + ".pth")
+        # Pose update monitoring
+        if hasattr(viewpoint_cam, "cam_rot_delta"):
+            print(f"[ITER {iteration}] Pose delta norm: {torch.norm(viewpoint_cam.cam_rot_delta).item():.4f}")
 
-    if args.use_dust3r:
-        with open(os.path.join(dataset.source_path, f'dust3r_{args.sparse_view_num}.json'), 'r') as f:
-            json_cameras = json.load(f)
-        refined_cameras = []
-        for viewpoint_cam, json_camera in zip(scene.getTrainCameras(), json_cameras):
-            camera = json_camera
-            w2c = np.eye(4)
-            w2c[:3, :3] = viewpoint_cam.R.T
-            w2c[:3, 3] = viewpoint_cam.T
-            c2w = np.linalg.inv(w2c)
-            camera['position'] = c2w[:3, 3].tolist()
-            camera['rotation'] = c2w[:3, :3].tolist()
-            refined_cameras.append(camera)
-        with open(os.path.join(scene.model_path, 'refined_cams.json'), 'w') as f:
-            json.dump(refined_cameras, f, indent=4)
+    from scipy.spatial.transform import Rotation as R
+    est_R = viewpoint_cam.R
+    true_R = viewpoint_cam.R_gt
+    R_diff = R.from_matrix(est_R @ true_R.T)
+    rot_angle_deg = np.linalg.norm(R_diff.as_rotvec()) * (180.0 / np.pi)
+
+    # --- Translation recovery error ---
+    est_T = viewpoint_cam.T
+    true_T = viewpoint_cam.T_gt
+    trans_error = np.linalg.norm(est_T - true_T)
+
+    print(f"Recovered pose error for cam {viewpoint_cam.uid}:")
+    print(f"  Rotation error: {rot_angle_deg:.2f} deg (applied: {viewpoint_cam.rot_noise_deg:.2f} deg)")
+    print(f"  Translation error: {trans_error:.3f} m (applied: {np.linalg.norm(viewpoint_cam.trans_noise_vec):.3f} m)")
+
+
 
 def prepare_output_and_logger(args):
     if not args.model_path:
@@ -339,6 +340,19 @@ if __name__ == "__main__":
     parser.add_argument('--mono_depth_weight', type=float, default=0.0005, help="The rate of monodepth loss")
     parser.add_argument('--lambda_t_norm', type=float, default=0.0005)
     parser.add_argument('--mono_loss_type', type=str, default="mid")
+
+    parser.add_argument('--bundle_adjust', action='store_true',
+                    help='Enable BARF-style camera pose optimization')
+
+    parser.add_argument('--pose_noise', action='store_true',
+                        help='Inject synthetic pose noise for testing optimization')
+
+    parser.add_argument('--pose_noise_deg', type=float, default=10.0,
+                        help='Degrees of rotation noise applied to initial camera pose')
+
+    parser.add_argument('--pose_noise_trans', type=float, default=0.1,
+                        help='Magnitude of translation noise applied to initial camera pose (in meters)')
+
 
     args = parser.parse_args(sys.argv[1:])
     args.save_iterations.append(args.iterations)

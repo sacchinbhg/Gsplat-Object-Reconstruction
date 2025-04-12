@@ -83,8 +83,8 @@ class Camera(nn.Module):
 
 class Camera_w_pose(Camera):
     def __init__(self, colmap_id, R, T, FoVx, FoVy, image, gt_alpha_mask, mono_depth,
-                 image_name, uid, trans=np.array([0.0, 0.0, 0.0]), scale=1.0, data_device = "cuda", white_background=False, confidence=None
-                 ):
+             image_name, uid, trans=np.array([0.0, 0.0, 0.0]), scale=1.0, data_device = "cuda", white_background=False, confidence=None, **kwargs):
+
         super(Camera_w_pose, self).__init__(colmap_id, R, T, FoVx, FoVy, image, gt_alpha_mask, mono_depth, image_name, uid, trans, scale, data_device, white_background, confidence)
 
         self.cam_rot_delta = nn.Parameter(
@@ -100,6 +100,36 @@ class Camera_w_pose(Camera):
         self.exposure_b = nn.Parameter(
             torch.tensor([0.0], requires_grad=True, device=data_device)
         )
+
+        import math
+        from scipy.spatial.transform import Rotation as R
+
+        # Store original GT pose
+        self.R_gt = R.copy()
+        self.T_gt = T.copy()
+
+        self.R = R
+        self.T = T
+
+        # === Inject synthetic error ===
+        if hasattr(extra_opts := kwargs.get("extra_opts", {}), "pose_noise") and extra_opts.get("pose_noise", False):
+            noise_deg = extra_opts.get("pose_noise_deg", 1.0)  # degrees
+            noise_trans = extra_opts.get("pose_noise_trans", 0.1)  # meters
+
+            # --- ROTATION ERROR ---
+            angle_axis = torch.randn(3)
+            angle_axis = angle_axis / angle_axis.norm() * math.radians(noise_deg)
+            rot_noise = R.from_rotvec(angle_axis.numpy()).as_matrix()
+            self.R = rot_noise @ self.R  # Right multiply = local perturbation
+
+            # Store true noise applied (angle_axis in radians)
+            self.rot_noise_axis = angle_axis.numpy()
+            self.rot_noise_deg = noise_deg
+
+            # --- TRANSLATION ERROR ---
+            trans_noise = np.random.normal(scale=noise_trans, size=(3,))
+            self.T = self.T + trans_noise
+            self.trans_noise_vec = trans_noise
 
     def update_RT(self, R, t):
         self.R = R
